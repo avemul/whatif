@@ -1,0 +1,96 @@
+import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+import re
+from sklearn.linear_model import LinearRegression
+from xgboost import XGBRegressor
+stocks = {
+    "oil": "CL=F",
+    "sp500": "^GSPC",
+    "energy": "XLE",
+    "tech": "XLK"
+}
+
+data = {}
+for name, stock in stocks.items():
+    df = yf.download(stock, start="2010-01-01", end="2025-01-01")['Close']
+    if df.empty:
+        print(f"No data for {name} ({stock})")
+        exit()
+    data[name] = df
+
+df = pd.concat(data.values(), axis=1)
+df.columns = data.keys()
+df.dropna(inplace=True)
+df_pct = df.pct_change()
+def parse_what_if(statement):
+    statement = statement.lower()
+    trigger_asset = None
+    for asset in stocks:
+        if re.search(rf'\b{asset}\b', statement):
+            trigger_asset = asset
+            break
+    if not trigger_asset:
+        raise ValueError("Asset not recognized in input.")
+    cleaned_statement = re.sub(rf'\b{trigger_asset}\b', '', statement)
+    if any(word in statement for word in ["drop", "-", "fall", "decline", "down"]):
+        direction = -1
+    elif any(word in statement for word in ["rise", "+", "increase", "gain", "up"]):
+        direction = 1
+    else:
+        raise ValueError("Couldn't detect rise/drop direction.")
+    pct_match = re.search(r"(\d+(\.\d+)?)\s*%?", cleaned_statement)
+    if not pct_match:
+        raise ValueError("Couldn't extract a percentage.")
+    threshold = direction * float(pct_match.group(1)) / 100
+    return trigger_asset, threshold
+print("\nAvailable assets:", list(stocks.keys()))
+user_input = input("Enter your what if statement (e.g., 'What if tech drops 8%?'): ")
+trigger_asset, threshold = parse_what_if(user_input)
+crash_days = df_pct[df_pct[trigger_asset] <= threshold].index
+reaction_data = {k: [] for k in stocks if k != trigger_asset}
+X_train = []
+y_train = {k: [] for k in reaction_data}
+for day in crash_days:
+    try:
+        segment = df.loc[day:].iloc[1:11]
+        start = df.loc[day]
+        percent_change = (segment / start - 1) * 100
+        for k in reaction_data:
+            reaction_data[k].append(percent_change[k].values)
+        start_return = df_pct.loc[day][trigger_asset]
+        X_train.append([start_return])
+        for k in y_train:
+            y_train[k].append(percent_change[k].sum())
+    except:
+        continue
+avg_reaction = {k: pd.DataFrame(v).mean() for k, v in reaction_data.items()}
+avg_df = pd.DataFrame(avg_reaction)
+avg_df.index = range(1, 11)
+X_new = [[threshold]]
+models_lr = {}
+models_xgb = {}
+preds_xgb = {}
+
+for k in y_train:
+    lr_model = LinearRegression()
+    lr_model.fit(X_train, y_train[k])
+    models_lr[k] = lr_model
+    xgb_model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, objective='reg:squarederror', random_state=42)
+    xgb_model.fit(X_train, y_train[k])
+    models_xgb[k] = xgb_model
+    preds_xgb[k] = xgb_model.predict(X_new)[0]
+plt.figure(figsize=(12, 6))
+for col in avg_df.columns:
+    plt.plot(avg_df[col], label=col.upper(), linewidth=2)
+plt.title(f"Predicted 10-Day Reaction to {threshold*100:.1f}% Move in {trigger_asset.upper()}")
+plt.xlabel("Days After Event")
+plt.ylabel("Cumulative % Change")
+plt.axhline(0, color='gray', linestyle='--')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+print(f"\nPredicted 10-Day Change After {threshold*100:.1f}% Move in {trigger_asset.upper()}:")
+for asset, pred in preds_xgb.items():
+    print(f"{asset.upper():<10}: {pred:.2f}%")
