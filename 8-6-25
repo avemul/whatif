@@ -1,0 +1,65 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta
+import re
+
+stocks = ["AAPL", "MSFT", "GOOGL", "XOM", "CVX"]
+drivers = {
+    "oil": "CL=F",
+    "tech": "XLK",
+    "energy": "XLE"
+}
+lookback_days = 60
+forecast_horizon = 10
+
+end = datetime.today()
+start = end - timedelta(days=365 * 3)
+
+print("Downloading stock data...")
+stock_data_raw = yf.download(stocks, start=start, end=end, group_by='ticker', auto_adjust=True)
+stock_data = pd.concat([stock_data_raw[ticker]['Close'] for ticker in stocks], axis=1)
+stock_data.columns = stocks
+
+print("Downloading driver data...")
+driver_data = {}
+for name, ticker in drivers.items():
+    series = yf.download(ticker, start=start, end=end, auto_adjust=True)['Close'].rename(name)
+    driver_data[name] = series
+
+data = stock_data.copy()
+for name, series in driver_data.items():
+    data[name] = series
+data.dropna(inplace=True)
+
+def create_lagged_features(df, cols, window):
+    features = pd.DataFrame(index=df.index)
+    for col in cols:
+        for lag in range(1, window + 1):
+            features[f"{col}_lag_{lag}"] = df[col].shift(lag)
+    return features.dropna()
+
+X_all = create_lagged_features(data, list(drivers.keys()), lookback_days)
+
+models = {}
+scalers = {}
+
+for stock in stocks:
+    y = data[stock].shift(-1).reindex(X_all.index)
+    X = X_all.copy()
+    y = y.loc[X.index]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_scaled, y)
+
+    models[stock] = model
+    scalers[stock] = scaler
+
+def forecast(models, scalers, X_last_row, driver_to_change, pct_change):
+    X_sim = X_
