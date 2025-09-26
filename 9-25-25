@@ -1,0 +1,400 @@
+import os
+import re
+import math
+import json
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error
+
+try:
+    import nltk
+    # nltk.download('vader_lexicon')
+    # nltk.download('stopwords')
+    from nltk.corpus import stopwords
+    from nltk.sentiment import SentimentIntensityAnalyzer
+except Exception as e:
+    nltk = None
+    stopwords = None
+    SentimentIntensityAnalyzer = None
+
+try:
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import torch
+    _HAS_FINBERT = True
+except Exception:
+    _HAS_FINBERT = False
+
+try:
+    from sentence_transformers import SentenceTransformer
+    _HAS_EMBED = True
+except Exception:
+    _HAS_EMBED = False
+
+try:
+    from pytrends.request import TrendReq
+    _HAS_TRENDS = True
+except Exception:
+    _HAS_TRENDS = False
+
+try:
+    from pandas_datareader import data as pdr
+    _HAS_FRED = True
+except Exception:
+    _HAS_FRED = False
+
+try:
+    import feedparser
+    _HAS_FEEDPARSER = True
+except Exception:
+    _HAS_FEEDPARSER = False
+
+yf_series = {
+    "oil": "CL=F",
+    "gold": "GC=F",
+    "natgas": "NG=F",
+    "tech_etf": "XLK",
+    "energy_etf": "XLE",
+    "vix": "^VIX",
+    "dxy": "DX-Y.NYB",  
+    "eurusd": "EURUSD=X",
+    "usdjpy": "JPY=X",
+}
+
+
+fred_series = {
+    "cpi": "CPIAUCSL",       # CPI (index)
+    "unemployment": "UNRATE", # Unemployment rate (%)
+    "teny": "DGS10",          # 10-Year Treasury yield (%)
+    "fedfunds": "FEDFUNDS",   # Effective Federal Funds Rate (%)
+}
+
+trends_keywords = [
+    "recession", "inflation", "stock market", "oil prices", "interest rates"
+]
+
+rss_feeds = [
+    "http://feeds.reuters.com/reuters/businessNews",
+    "http://feeds.reuters.com/reuters/USMarketNews",
+    "https://www.bloomberg.com/feeds/podcasts/etf-report.xml",  # example; swap in any valid RSS
+]
+
+lookback_days = 60
+forecast_horizon = 10
+
+end = datetime.today()
+start = end - timedelta(days=365 * 3)
+
+def fetch_yf_series(ticker: str, name: str, start, end):
+    try:
+        s = yf.download(ticker, start=start, end=end, auto_adjust=True)["Close"].rename(name)
+        return s.dropna()
+    except Exception as e:
+        print(f"[WARN] yfinance failed for {name} ({ticker}): {e}")
+        return pd.Series(dtype=float, name=name)
+
+
+def fetch_fred_series(series_id: str, name: str, start, end):
+    if not _HAS_FRED:
+        print("[INFO] pandas_datareader not available; skipping FRED")
+        return pd.Series(dtype=float, name=name)
+    try:
+        s = pdr.DataReader(series_id, "fred", start, end).squeeze().rename(name)
+        return s.dropna()
+    except Exception as e:
+        print(f"[WARN] FRED failed for {name} ({series_id}): {e}")
+        return pd.Series(dtype=float, name=name)
+
+
+def fetch_google_trends(keywords, start, end, geo="US"):
+    if not _HAS_TRENDS:
+        print("[INFO] pytrends not available; skipping Google Trends")
+        return pd.DataFrame()
+    try:
+        tr = TrendReq(hl="en-US", tz=360)
+        tr.build_payload(keywords, timeframe=f"{start.strftime('%Y-%m-%d')} {end.strftime('%Y-%m-%d')}", geo=geo)
+        df = tr.interest_over_time()
+        if "isPartial" in df.columns:
+            df = df.drop(columns=["isPartial"])
+        return df
+    except Exception as e:
+        print(f"[WARN] Google Trends failed: {e}")
+        return pd.DataFrame()
+
+
+def fetch_rss_headlines(feeds):
+    if not _HAS_FEEDPARSER:
+        print("[INFO] feedparser not available; skipping RSS scraping")
+        return pd.DataFrame(columns=["published", "source", "headline"])    
+    rows = []
+    for url in feeds:
+        try:
+            parsed = feedparser.parse(url)
+            for entry in parsed.entries:
+                published = None
+                if hasattr(entry, "published_parsed") and entry.published_parsed:
+                    published = datetime(*entry.published_parsed[:6])
+                elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
+                    published = datetime(*entry.updated_parsed[:6])
+                headline = entry.title if hasattr(entry, "title") else ""
+                rows.append({
+                    "published": published,
+                    "source": re.sub(r"https?://(www\.)?", "", parsed.href) if hasattr(parsed, "href") else "rss",
+                    "headline": headline,
+                })
+        except Exception as e:
+            print(f"[WARN] RSS failed for {url}: {e}")
+    df = pd.DataFrame(rows).dropna(subset=["published"]) if rows else pd.DataFrame(columns=["published", "source", "headline"]) 
+    return df
+
+
+_stopwords = set(stopwords.words('english')) if stopwords else set()
+_sia = SentimentIntensityAnalyzer() if SentimentIntensityAnalyzer else None
+
+_finbert_tokenizer = None
+_finbert_model = None
+if _HAS_FINBERT:
+    try:
+        _finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        _finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    except Exception as e:
+        print(f"[WARN] FinBERT load failed: {e}")
+        _HAS_FINBERT = False
+
+_embedder = None
+if _HAS_EMBED:
+    try:
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception as e:
+        print(f"[WARN] Embedding model load failed: {e}")
+        _HAS_EMBED = False
+
+
+def clean_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    tokens = [t for t in s.split() if t not in _stopwords and len(t) > 2]
+    return " ".join(tokens)
+
+
+def score_vader(texts: list) -> np.ndarray:
+    if not _sia:
+        return np.array([np.nan] * len(texts))
+    scores = []
+    for t in texts:
+        try:
+            scores.append(_sia.polarity_scores(t)["compound"])
+        except Exception:
+            scores.append(np.nan)
+    return np.array(scores)
+
+
+def score_finbert(texts: list) -> np.ndarray:
+    if not _HAS_FINBERT:
+        return np.array([np.nan] * len(texts))
+    scores = []
+    for t in texts:
+        try:
+            inputs = _finbert_tokenizer(t, return_tensors="pt", truncation=True, max_length=128)
+            with torch.no_grad():
+                logits = _finbert_model(**inputs).logits
+            probs = torch.softmax(logits, dim=1).numpy()[0]
+            # FinBERT labels: [0]=negative, [1]=neutral, [2]=positive
+            score = probs[2] - probs[0]  # positive minus negative
+            scores.append(float(score))
+        except Exception:
+            scores.append(np.nan)
+    return np.array(scores)
+
+
+def embed_texts(texts: list) -> np.ndarray:
+    if not _HAS_EMBED or _embedder is None or not texts:
+        return np.empty((0, 0))
+    try:
+        return _embedder.encode(texts, show_progress_bar=False)
+    except Exception:
+        return np.empty((0, 0))
+
+
+def aggregate_sentiment(df_text: pd.DataFrame, freq: str = 'D') -> pd.DataFrame:
+    """Input columns: ['published', 'headline', 'source']
+       Returns time-indexed daily aggregates of VADER & FinBERT means and counts.
+    """
+    if df_text.empty:
+        return pd.DataFrame()
+    df = df_text.copy()
+    df["clean"] = df["headline"].astype(str).apply(clean_text)
+    df["vader"] = score_vader(df["clean"].tolist())
+    df["finbert"] = score_finbert(df["clean"].tolist())
+    df["date"] = pd.to_datetime(df["published"]).dt.tz_localize(None).dt.floor(freq)
+    agg = df.groupby("date").agg(
+        news_count=("headline", "count"),
+        vader_mean=("vader", "mean"),
+        finbert_mean=("finbert", "mean"),
+    )
+    return agg
+
+
+# ---------------------------
+# Assemble Feature Matrix
+# ---------------------------
+print("Downloading stock data…")
+stock_data_raw = yf.download(stocks, start=start, end=end, group_by='ticker', auto_adjust=True)
+stock_data = pd.concat([stock_data_raw[t]["Close"] for t in stocks], axis=1)
+stock_data.columns = stocks
+
+print("Downloading yfinance driver data…")
+yf_df = pd.DataFrame(index=stock_data.index)
+for name, ticker in yf_series.items():
+    s = fetch_yf_series(ticker, name, start, end)
+    yf_df = yf_df.join(s, how="outer")
+
+print("Downloading FRED macro series…")
+fred_df = pd.DataFrame()
+for name, sid in fred_series.items():
+    s = fetch_fred_series(sid, name, start, end)
+    fred_df = fred_df.join(s, how="outer")
+
+if not fred_df.empty:
+    fred_df = fred_df.resample('B').ffill()
+
+print("Fetching Google Trends…")
+trends_df = fetch_google_trends(trends_keywords, start, end)
+if not trends_df.empty:
+    trends_df.index = pd.to_datetime(trends_df.index).tz_localize(None)
+
+print("Scraping RSS headlines…")
+news_df = fetch_rss_headlines(rss_feeds)
+news_agg = aggregate_sentiment(news_df, 'D') if not news_df.empty else pd.DataFrame()
+
+print("Merging features…")
+data = stock_data.copy()
+for df in [yf_df, fred_df, trends_df, news_agg]:
+    if df is None or df.empty:
+        continue
+    data = data.join(df, how="outer")
+
+data = data.sort_index().ffill().dropna()
+
+def create_lagged_features(df, cols, window):
+    features = pd.DataFrame(index=df.index)
+    for col in cols:
+        if col not in df.columns:
+            continue
+        for lag in range(1, window + 1):
+            features[f"{col}_lag_{lag}"] = df[col].shift(lag)
+        features[f"{col}_roll_mean_5"] = df[col].rolling(5).mean()
+        features[f"{col}_roll_std_5"] = df[col].rolling(5).std()
+        features[f"{col}_mom_5"] = df[col].pct_change(5)
+    return features.dropna()
+
+non_stock_cols = [c for c in data.columns if c not in stocks]
+X_all = create_lagged_features(data, non_stock_cols, lookback_days)
+
+models = {}
+scalers = {}
+metrics = {}
+
+print("Training models… (time-series split)")
+tscv = TimeSeriesSplit(n_splits=5)
+
+for stock in stocks:
+    y = data[stock].shift(-1).reindex(X_all.index)  # predict next-day close
+    X = X_all.loc[y.index]
+
+
+    fold_mae = []
+    for train_idx, test_idx in tscv.split(X):
+        Xtr, Xte = X.iloc[train_idx], X.iloc[test_idx]
+        ytr, yte = y.iloc[train_idx], y.iloc[test_idx]
+        scaler = StandardScaler()
+        Xtr_s = scaler.fit_transform(Xtr)
+        Xte_s = scaler.transform(Xte)
+        model = RandomForestRegressor(n_estimators=400, random_state=42, n_jobs=-1, max_depth=None)
+        model.fit(Xtr_s, ytr)
+        pred = model.predict(Xte_s)
+        fold_mae.append(mean_absolute_error(yte, pred))
+    metrics[stock] = {"cv_mae": float(np.mean(fold_mae))}
+
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    model = RandomForestRegressor(n_estimators=800, random_state=42, n_jobs=-1)
+    model.fit(Xs, y)
+
+    models[stock] = model
+    scalers[stock] = scaler
+
+print("CV MAE:", json.dumps(metrics, indent=2))
+
+
+def _apply_pct_change_to_feature_row(row: pd.Series, feature_prefix: str, pct_change: float):
+    """Adjust the most recent lag and momentum features for a given driver.
+       feature_prefix is the base column name (e.g., 'oil').
+       We modify columns like 'oil_lag_1' and derived momentum if present.
+    """
+    new_row = row.copy()
+    col = f"{feature_prefix}_lag_1"
+    if col in new_row.index and pd.notna(new_row[col]):
+        new_row[col] = new_row[col] * (1 + pct_change)
+    mom = f"{feature_prefix}_mom_5"
+    if mom in new_row.index and pd.notna(new_row[mom]):
+        new_row[mom] = new_row[mom] + pct_change
+    return new_row
+
+
+def forecast_next_day(models: dict, scalers: dict, X_all: pd.DataFrame,
+                      adjustments: dict = None) -> pd.Series:
+    """One‑step ahead forecast for each stock with optional driver adjustments.
+       adjustments: { 'oil': +0.08, 'vix': -0.05, ... } percent changes
+    """
+    last_row = X_all.iloc[-1]
+    if adjustments:
+        for driver_name, pct in adjustments.items():
+            last_row = _apply_pct_change_to_feature_row(last_row, driver_name, pct)
+    preds = {}
+    for stock in stocks:
+        scaler = scalers[stock]
+        model = models[stock]
+        Xs = scaler.transform(last_row.to_frame().T)
+        preds[stock] = float(model.predict(Xs)[0])
+    return pd.Series(preds)
+
+def recursive_forecast(models, scalers, X_all, days=5, adjustments=None):
+    """Generate naive multi‑day forecasts by reusing the same last feature row
+       (with adjustments applied each step). This is a rough approximation since
+       we don't evolve the full feature set forward realistically.
+    """
+    last_row = X_all.iloc[-1].copy()
+    path = []
+    for d in range(days):
+        # apply adjustments each step
+        if adjustments:
+            for driver_name, pct in adjustments.items():
+                last_row = _apply_pct_change_to_feature_row(last_row, driver_name, pct)
+        step_preds = {}
+        for stock in stocks:
+            scaler = scalers[stock]
+            model = models[stock]
+            Xs = scaler.transform(last_row.to_frame().T)
+            step_preds[stock] = float(model.predict(Xs)[0])
+        path.append(step_preds)
+    return pd.DataFrame(path, index=pd.RangeIndex(1, days+1, name="T+day"))
+
+def plot_forecasts(actual_series: pd.Series, preds: pd.Series, title: str = "Next‑Day Forecast"):
+    plt.figure()
+    actual_series.tail(60).plot(label="Actual")
+    preds.plot(style='o', label="Forecast")
+    plt.legend()
+    plt.title(title)
+    plt.xlabel("Date / Step")
+    plt.ylabel("Price")
+    plt.show()
